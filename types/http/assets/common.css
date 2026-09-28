@@ -1,24 +1,13 @@
 :root {
-    --bg: #f3f3f0;
-    --fg: #1b1f22;
-    --muted: #5b6268;
-    --accent: #3e8e86;
-    --border: #d8d9d5;
-    --surface: #e4e9e6;
-    --dot: #bcc3bf;
+    --bg: #000000;
+    --fg: #f3f3f0;
+    --muted: #b8b8b8;
+    --accent: #78d6ff;
+    --border: #333333;
+    --surface: #111111;
+    --dot: #000000;
 }
 
-@media screen and (prefers-color-scheme: dark) {
-    :root {
-        --bg: #14171a;
-        --fg: #f3f3f0;
-        --muted: #c7cbc7;
-        --accent: #46968e;
-        --border: #2c3337;
-        --surface: #272d30;
-        --dot: #2c3337;
-    }
-}
 
 html,
 body {
@@ -40,11 +29,7 @@ body {
 
 html {
     min-height: 100%;
-    background-image: radial-gradient(
-        1024px 384px at 50% 0%,
-        var(--accent-tint),
-        transparent 100%
-    );
+    background-image: none;
     background-repeat: no-repeat;
     -webkit-text-size-adjust: 100%;
     text-size-adjust: 100%;
@@ -53,11 +38,9 @@ html {
 }
 
 .body-bg {
-    background-image: radial-gradient(
-        color-mix(in srgb, var(--dot) 60%, transparent) 1px,
-        transparent 1px
-    );
-    background-size: 12px 12px;
+    background-image: none;
+    background-size: auto;
+    display: none;
     position: absolute;
     top: 0;
     left: 0;

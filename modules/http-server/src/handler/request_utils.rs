@@ -274,7 +274,7 @@ pub(super) async fn execute_error_pipeline(
     error_ctx.trace_context = trace_context;
     error_ctx.variables = variables;
 
-    if let Err(error) = error_pipeline.execute_without_inverse(&mut error_ctx).await {
+    if let Err(error) = error_pipeline.execute(&mut error_ctx).await {
         emit_error(
             events,
             format!("Error pipeline execution error: {error}"),

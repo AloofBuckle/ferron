@@ -417,40 +417,64 @@ async fn apply_resolved_file_to_context(
         "file",
         control_plane_metadata,
     );
-    let pipeline_result = if let Some(timeout) = timeout {
+    let mut executed_stages = Vec::new();
+    let forward_result = if let Some(timeout) = timeout {
         if has_traces {
-            zincio::time::timeout(timeout, async {
-                let executed_stages = file_pipeline
-                    .execute_without_inverse_with_hooks(&mut file_ctx, &mut stage_hooks)
-                    .await?;
-                file_pipeline
-                    .execute_inverse_with_hooks(&mut file_ctx, executed_stages, &mut stage_hooks)
-                    .await
-            })
+            zincio::time::timeout(
+                timeout,
+                file_pipeline.execute_forward_with_hooks(
+                    &mut file_ctx,
+                    &mut stage_hooks,
+                    &mut executed_stages,
+                ),
+            )
             .await
         } else {
-            zincio::time::timeout(timeout, file_pipeline.execute(&mut file_ctx)).await
+            zincio::time::timeout(
+                timeout,
+                file_pipeline.execute_forward(&mut file_ctx, &mut executed_stages),
+            )
+            .await
         }
     } else if has_traces {
-        Ok(async {
-            let executed_stages = file_pipeline
-                .execute_without_inverse_with_hooks(&mut file_ctx, &mut stage_hooks)
-                .await?;
-            file_pipeline
-                .execute_inverse_with_hooks(&mut file_ctx, executed_stages, &mut stage_hooks)
-                .await
-        }
-        .await)
+        Ok(file_pipeline
+            .execute_forward_with_hooks(&mut file_ctx, &mut stage_hooks, &mut executed_stages)
+            .await)
     } else {
-        Ok(file_pipeline.execute(&mut file_ctx).await)
+        Ok(file_pipeline
+            .execute_forward(&mut file_ctx, &mut executed_stages)
+            .await)
     };
+
+    if forward_result.is_err() {
+        stage_hooks.flush_with_context(&mut file_ctx);
+    }
+    // Cleanup is outside the forward timeout, so completed stages still run
+    // their inverse pass after a timeout cancels the in-flight stage.
+    let inverse_result = if has_traces {
+        file_pipeline
+            .execute_inverse_with_hooks(&mut file_ctx, executed_stages, &mut stage_hooks)
+            .await
+    } else {
+        file_pipeline
+            .execute_inverse(&mut file_ctx, executed_stages)
+            .await
+    };
+
+    if !matches!(&forward_result, Ok(Ok(()))) {
+        if let Err(error) = &inverse_result {
+            ferron_core::log_error!(
+                "HTTP file pipeline inverse failed after forward error or timeout: {error}"
+            );
+        }
+    }
 
     drop(stage_hooks);
 
     *ctx = file_ctx.http;
 
-    match pipeline_result {
-        Ok(Ok(v)) => Ok(v),
+    match forward_result {
+        Ok(Ok(())) => inverse_result.map_err(FilePipelineExecutionError::Pipeline),
         Ok(Err(e)) => Err(FilePipelineExecutionError::Pipeline(e)),
         Err(_) => Err(FilePipelineExecutionError::Timeout),
     }

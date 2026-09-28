@@ -17,6 +17,7 @@ use ferron_core::registry::RegistryBuilder;
 use ferron_http::{HttpErrorContext, HttpFileContext};
 
 pub use stages::{DirectoryListingStage, ErrorPageStage, StaticFileStage};
+pub use util::file_stream::FileStream;
 pub use validator::HttpStaticConfigurationValidator;
 
 /// Module loader for the HTTP static file module.

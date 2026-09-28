@@ -27,6 +27,7 @@ pub struct FileStream {
     file: SendWrapper<std::rc::Rc<std::cell::UnsafeCell<ReusedFile>>>,
     current_pos: u64,
     remaining: Option<u64>,
+    max_buffer_size: usize,
     finished: bool,
     started: bool,
     read_future: Option<ReadChunkFuture>,
@@ -37,14 +38,30 @@ impl FileStream {
     /// If `end` is `None`, reads until EOF.
     #[inline]
     pub fn new(file: ReusedFile, start: u64, end: Option<u64>) -> Self {
+        Self::with_buffer_size(file, start, end, MAX_BUFFER_SIZE)
+    }
+
+    /// Create a file stream with a caller-selected maximum read size.
+    /// Large bulk-transfer paths can use bigger reads to reduce body-frame and
+    /// completion overhead without changing Ferron's general static-file
+    /// latency/memory tradeoff.
+    #[inline]
+    pub fn with_buffer_size(
+        file: ReusedFile,
+        start: u64,
+        end: Option<u64>,
+        max_buffer_size: usize,
+    ) -> Self {
         let remaining = remaining_from_bounds(start, end);
         let finished = matches!(remaining, Some(0));
+        let max_buffer_size = max_buffer_size.max(1);
 
         Self {
             started: false,
             file: SendWrapper::new(std::rc::Rc::new(std::cell::UnsafeCell::new(file))),
             current_pos: start,
             remaining,
+            max_buffer_size,
             finished,
             read_future: None,
         }
@@ -61,6 +78,7 @@ impl FileStream {
             file: self.file.clone(),
             current_pos: start,
             remaining,
+            max_buffer_size: self.max_buffer_size,
             finished,
             read_future: None,
         }
@@ -88,6 +106,7 @@ impl Stream for FileStream {
                 self.file.clone(),
                 self.current_pos,
                 self.remaining,
+                self.max_buffer_size,
             ))));
         }
 
@@ -112,10 +131,16 @@ impl Stream for FileStream {
                     let file = self.file.clone();
                     let current_pos = self.current_pos;
                     let remaining = self.remaining;
+                    let max_buffer_size = self.max_buffer_size;
                     self.read_future
                         .as_mut()
                         .expect("file stream read future is not initialized")
-                        .set(SendWrapper::new(read_chunk(file, current_pos, remaining)));
+                        .set(SendWrapper::new(read_chunk(
+                            file,
+                            current_pos,
+                            remaining,
+                            max_buffer_size,
+                        )));
                 }
                 Poll::Ready(Some(Ok(chunk)))
             }
@@ -138,8 +163,8 @@ impl Stream for FileStream {
         (
             self.remaining.map_or(0, |r| {
                 // Divide and add 1 if reminder > 0
-                r.saturating_div(MAX_BUFFER_SIZE as u64)
-                    + u64::from(r % MAX_BUFFER_SIZE as u64 != 0)
+                r.saturating_div(self.max_buffer_size as u64)
+                    + u64::from(r % self.max_buffer_size as u64 != 0)
             }) as usize,
             None,
         )
@@ -152,9 +177,9 @@ fn remaining_from_bounds(start: u64, end: Option<u64>) -> Option<u64> {
 }
 
 #[inline]
-fn buffer_size_for_read(remaining: Option<u64>) -> usize {
-    remaining.map_or(MAX_BUFFER_SIZE, |remaining| {
-        remaining.min(MAX_BUFFER_SIZE as u64) as usize
+fn buffer_size_for_read(remaining: Option<u64>, max_buffer_size: usize) -> usize {
+    remaining.map_or(max_buffer_size, |remaining| {
+        remaining.min(max_buffer_size as u64) as usize
     })
 }
 
@@ -163,8 +188,9 @@ async fn read_chunk(
     file: SendWrapper<std::rc::Rc<std::cell::UnsafeCell<ReusedFile>>>,
     pos: u64,
     remaining: Option<u64>,
+    max_buffer_size: usize,
 ) -> ReadChunkResult {
-    let buffer_sz = buffer_size_for_read(remaining);
+    let buffer_sz = buffer_size_for_read(remaining, max_buffer_size);
     if buffer_sz == 0 {
         return None;
     }
