@@ -941,6 +941,8 @@ fn load_modules(
 
         if shutdown {
             log_info!("Shutting down the server...");
+            #[cfg(feature = "ferron-http-cache")]
+            runtime.block_on(ferron_http_cache::shutdown_persistence());
             return Ok(());
         } else {
             ferron_core::admin::ADMIN_METRICS

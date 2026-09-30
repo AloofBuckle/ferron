@@ -68,17 +68,33 @@ struct PooledHandle {
     file: zincio::fs::File,
     /// When this handle was returned to the pool.
     pooled_at: Instant,
+    identity: Option<FileIdentity>,
 }
 
-struct PooledError {
-    error: std::io::Error,
-    pooled_at: Instant,
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+fn file_identity(metadata: &zincio::fs::Metadata) -> Option<FileIdentity> {
+    #[cfg(target_os = "linux")]
+    {
+        Some(FileIdentity {
+            device: metadata.st_dev(),
+            inode: metadata.st_ino(),
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = metadata;
+        None
+    }
 }
 
 #[derive(Default)]
 struct FdPoolItem {
     handles: Vec<PooledHandle>,
-    error: Option<PooledError>,
 }
 
 /// Per-thread file descriptor reuse pool with expired eviction.
@@ -145,6 +161,7 @@ pub struct ReusedFile {
     metadata: Result<zincio::fs::Metadata, std::io::Error>,
     path: PathBuf,
     dont_rewind: bool,
+    identity: Option<FileIdentity>,
 }
 
 impl ReusedFile {
@@ -161,28 +178,6 @@ impl ReusedFile {
         root_path: impl AsRef<Path>,
         symlink_mode: SymlinkMode,
     ) -> io::Result<Self> {
-        let cached_error = FD_REUSE_CACHE.with(|c| {
-            let mut cache = c.borrow_mut();
-            let path_key = (path.as_ref().to_path_buf(), symlink_mode);
-            let ent = cache.entries.get_mut(&path_key)?;
-            let err = ent.error.as_ref()?;
-            if err.pooled_at.elapsed() < FD_CACHE_TTL {
-                let e = &err.error;
-                let e2 = if let Some(e) = e.raw_os_error() {
-                    std::io::Error::from_raw_os_error(e)
-                } else {
-                    std::io::Error::new(e.kind(), e.to_string())
-                };
-                Some(e2)
-            } else {
-                ent.error = None;
-                None
-            }
-        });
-        if let Some(e) = cached_error {
-            return Err(e);
-        }
-
         // Try reusing from pool first
         let pooled = FD_REUSE_CACHE.with(|c| {
             let mut cache = c.borrow_mut();
@@ -208,50 +203,44 @@ impl ReusedFile {
         });
 
         if let Some(pooled) = pooled {
-            let file = pooled.file;
-            let metadata = file.metadata().await;
-            return Ok(Self {
-                inner: Some(file),
-                metadata,
-                path: path.as_ref().to_path_buf(),
-                symlink_mode,
-                dont_rewind: false,
+            // Revalidate the path, not just the open inode. TTL is only a
+            // resource policy; it cannot establish rename/unlink consistency.
+            check_symlinks_in_path(path.as_ref(), root_path.as_ref(), symlink_mode).await?;
+            let metadata = zincio::fs::metadata(path.as_ref()).await?;
+            let identity = file_identity(&metadata);
+            if identity.is_some() && identity == pooled.identity {
+                return Ok(Self {
+                    inner: Some(pooled.file),
+                    metadata: Ok(metadata),
+                    identity,
+                    path: path.as_ref().to_path_buf(),
+                    symlink_mode,
+                    dont_rewind: false,
+                });
+            }
+            // Any other cached handles for this path have the same obsolete
+            // provenance. Discard them before opening the current path.
+            FD_REUSE_CACHE.with(|cache| {
+                cache
+                    .borrow_mut()
+                    .entries
+                    .remove(&(path.as_ref().to_path_buf(), symlink_mode));
             });
         }
 
         // Pool miss...
-        let file = match Self::open_with_symlink_mode_nocache(
-            path.as_ref(),
-            root_path.as_ref(),
-            symlink_mode,
-        )
-        .await
-        {
-            Ok(file) => file,
-            Err(e) => {
-                let e2 = if let Some(e) = e.raw_os_error() {
-                    std::io::Error::from_raw_os_error(e)
-                } else {
-                    std::io::Error::new(e.kind(), e.to_string())
-                };
-                FD_REUSE_CACHE.with(|c| {
-                    let mut cache = c.borrow_mut();
-                    let path_key = (path.as_ref().to_path_buf(), symlink_mode);
-                    cache.entries.entry(path_key).or_default().error = Some(PooledError {
-                        error: e2,
-                        pooled_at: Instant::now(),
-                    });
-                });
-                return Err(e)?;
-            }
-        };
+        let file =
+            Self::open_with_symlink_mode_nocache(path.as_ref(), root_path.as_ref(), symlink_mode)
+                .await?;
         let metadata = file.metadata().await;
+        let identity = metadata.as_ref().ok().and_then(file_identity);
         Ok(Self {
             inner: Some(file),
             metadata,
             path: path.as_ref().to_path_buf(),
             symlink_mode,
             dont_rewind: false,
+            identity,
         })
     }
 
@@ -270,6 +259,7 @@ impl ReusedFile {
         inner: zincio::fs::File,
         path_buf: PathBuf,
         symlink_mode: SymlinkMode,
+        identity: Option<FileIdentity>,
     ) {
         FD_REUSE_CACHE.with(move |c| {
             let mut cache = c.borrow_mut();
@@ -282,6 +272,7 @@ impl ReusedFile {
                 .push(PooledHandle {
                     file: inner,
                     pooled_at: Instant::now(),
+                    identity,
                 });
         });
     }
@@ -391,7 +382,9 @@ impl Drop for ReusedFile {
 
             let path_buf = self.path.clone();
             let symlink_mode = self.symlink_mode;
-            Self::return_handle_to_pool(inner, path_buf, symlink_mode);
+            if self.identity.is_some() {
+                Self::return_handle_to_pool(inner, path_buf, symlink_mode, self.identity);
+            }
         }
     }
 }
@@ -454,6 +447,166 @@ async fn check_symlinks_in_path(path: &Path, root: &Path, mode: SymlinkMode) -> 
 mod tests {
     use super::*;
 
+    struct Scratch(PathBuf);
+    impl Scratch {
+        fn new() -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "ferron-fd-consistency-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            FD_REUSE_CACHE.with(|cache| {
+                cache
+                    .borrow_mut()
+                    .entries
+                    .retain(|(path, _), _| !path.starts_with(&self.0))
+            });
+            std::fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+    fn runtime() -> zincio::Runtime {
+        zincio::RuntimeBuilder::new()
+            .driver(zincio::DriverKind::Mio)
+            .enable_timer(true)
+            .build()
+            .unwrap()
+    }
+    async fn contents(file: &ReusedFile) -> Vec<u8> {
+        let (result, buffer) = file.read_at(vec![0u8; 128], 0).await;
+        buffer[..result.unwrap()].to_vec()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unchanged_path_reuses_descriptor() {
+        runtime().block_on(async {
+            let temp = Scratch::new();
+            let path = temp.0.join("file");
+            std::fs::write(&path, b"same").unwrap();
+            let first = ReusedFile::open(&path).await.unwrap();
+            let fd = first.as_raw_fd();
+            drop(first);
+            let second = ReusedFile::open(&path).await.unwrap();
+            assert_eq!(second.as_raw_fd(), fd);
+            assert_eq!(contents(&second).await, b"same");
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn hot_atomic_replacement_does_not_reuse_old_hardlinked_inode() {
+        runtime().block_on(async {
+            let temp = Scratch::new();
+            let path = temp.0.join("file");
+            std::fs::write(&path, b"old").unwrap();
+            std::fs::hard_link(&path, temp.0.join("old-hardlink")).unwrap();
+            drop(ReusedFile::open(&path).await.unwrap());
+            for n in 0..64 {
+                let expected = format!("version-{n}");
+                let next = temp.0.join("next");
+                std::fs::write(&next, expected.as_bytes()).unwrap();
+                std::fs::rename(&next, &path).unwrap();
+                let current = ReusedFile::open(&path).await.unwrap();
+                assert_eq!(contents(&current).await, expected.as_bytes());
+            }
+        });
+    }
+
+    #[test]
+    fn deletion_and_immediate_recreation_are_visible() {
+        runtime().block_on(async {
+            let temp = Scratch::new();
+            let path = temp.0.join("file");
+            std::fs::write(&path, b"old").unwrap();
+            drop(ReusedFile::open(&path).await.unwrap());
+            std::fs::remove_file(&path).unwrap();
+            assert_eq!(
+                ReusedFile::open(&path).await.err().unwrap().kind(),
+                io::ErrorKind::NotFound
+            );
+            std::fs::write(&path, b"new").unwrap();
+            assert_eq!(
+                contents(&ReusedFile::open(&path).await.unwrap()).await,
+                b"new"
+            );
+        });
+    }
+
+    #[test]
+    fn cached_missing_path_does_not_hide_new_file() {
+        runtime().block_on(async {
+            let temp = Scratch::new();
+            let path = temp.0.join("new");
+            assert!(ReusedFile::open(&path).await.is_err());
+            std::fs::write(&path, b"created").unwrap();
+            assert_eq!(
+                contents(&ReusedFile::open(&path).await.unwrap()).await,
+                b"created"
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pooled_inode_cannot_bypass_new_symlink_policy() {
+        runtime().block_on(async {
+            let temp = Scratch::new();
+            let path = temp.0.join("file");
+            std::fs::write(&path, b"same inode").unwrap();
+            drop(
+                ReusedFile::open_with_symlink_mode(&path, &temp.0, SymlinkMode::On)
+                    .await
+                    .unwrap(),
+            );
+            let moved = temp.0.join("real");
+            std::fs::rename(&path, &moved).unwrap();
+            std::os::unix::fs::symlink(&moved, &path).unwrap();
+            assert_eq!(
+                ReusedFile::open_with_symlink_mode(&path, &temp.0, SymlinkMode::On)
+                    .await
+                    .err()
+                    .unwrap()
+                    .kind(),
+                io::ErrorKind::PermissionDenied
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parent_symlink_change_is_revalidated_for_pooled_handle() {
+        runtime().block_on(async {
+            let temp = Scratch::new();
+            let parent = temp.0.join("parent");
+            std::fs::create_dir(&parent).unwrap();
+            let path = parent.join("file");
+            std::fs::write(&path, b"same inode").unwrap();
+            drop(
+                ReusedFile::open_with_symlink_mode(&path, &temp.0, SymlinkMode::On)
+                    .await
+                    .unwrap(),
+            );
+            let moved = temp.0.join("moved");
+            std::fs::rename(&parent, &moved).unwrap();
+            std::os::unix::fs::symlink(&moved, &parent).unwrap();
+            assert_eq!(
+                ReusedFile::open_with_symlink_mode(&path, &temp.0, SymlinkMode::On)
+                    .await
+                    .err()
+                    .unwrap()
+                    .kind(),
+                io::ErrorKind::PermissionDenied
+            );
+        });
+    }
+
     #[test]
     fn pool_eviction_removes_expired() {
         let mut pool = FdPool::new();
@@ -476,6 +629,7 @@ mod tests {
                 .push(PooledHandle {
                     file: std_file,
                     pooled_at: Instant::now(),
+                    identity: None,
                 });
         }
 
@@ -491,6 +645,7 @@ mod tests {
             .push(PooledHandle {
                 file: std_file,
                 pooled_at: Instant::now() - Duration::from_secs(1), // expired
+                identity: None,
             });
 
         // Pool is now over capacity; eviction should remove the expired handle

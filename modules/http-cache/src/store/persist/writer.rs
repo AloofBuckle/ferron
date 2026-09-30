@@ -54,11 +54,6 @@ pub const DEFAULT_QUEUE_CAPACITY: usize = 8192;
 /// How often the writer compacts a zone's journal into a fresh snapshot.
 const COMPACT_INTERVAL: Duration = Duration::from_secs(300);
 
-/// How long the writer sleeps at most when there is nothing to do. Bounds
-/// how quickly shutdown is observed and how promptly a freshly registered
-/// zone is picked up when no mutation ever wakes the thread.
-const WRITER_POLL_INTERVAL: Duration = Duration::from_millis(50);
-
 /// Enumerates the live cache entries of a zone. Used by the writer thread to
 /// dump a snapshot without knowing anything about the in-memory store.
 pub type EntrySource = Box<dyn Fn(&mut dyn FnMut(&str, &StoredEntry)) + Send + Sync>;
@@ -88,6 +83,40 @@ pub struct ZonePersistState {
     /// Back-reference to the manager, used to reach the configured event
     /// sinks for log events. `None` for states built directly in tests.
     manager: Option<Weak<PersistManager>>,
+}
+
+#[cfg(test)]
+mod scheduling_tests {
+    use super::*;
+
+    #[test]
+    fn idle_zone_has_no_polling_deadline() {
+        let zone = ZonePersistState::new(
+            "idle".into(),
+            PathBuf::new(),
+            false,
+            Duration::from_secs(30),
+            8,
+            Arc::new(Notify::new()),
+            None,
+        );
+        assert!(zone.next_deadline().is_none());
+        zone.record_delete("changed");
+        assert!(zone.next_deadline().is_some());
+    }
+
+    #[tokio::test]
+    async fn captured_shutdown_wakes_an_idle_writer() {
+        let manager = PersistManager::new();
+        let shutdown = Arc::new(tokio_util::sync::CancellationToken::new());
+        let writer = tokio::spawn(manager.clone().run(shutdown.clone()));
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(2), writer)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(manager.finished.is_cancelled());
+    }
 }
 
 impl ZonePersistState {
@@ -320,6 +349,21 @@ impl ZonePersistState {
     /// calls this once at zone creation; compaction is a no-op without it.
     pub fn register_entry_source(&self, source: EntrySource) {
         *self.entry_source.lock() = Some(source);
+        self.wake();
+    }
+
+    fn next_deadline(&self) -> Option<Instant> {
+        if !self.active.load(Ordering::Relaxed) {
+            return None;
+        }
+        let flush = (!self.queue.lock().is_empty())
+            .then(|| *self.last_flush.lock() + self.persist_interval);
+        let compact = self
+            .entry_source
+            .lock()
+            .is_some()
+            .then(|| *self.last_compact.lock() + self.compact_interval);
+        flush.into_iter().chain(compact).min()
     }
 
     /// Whether the interval since the last compaction has elapsed.
@@ -620,6 +664,7 @@ pub struct PersistManager {
     wake: Arc<Notify>,
     stop: Arc<AtomicBool>,
     task: OnceLock<tokio::task::JoinHandle<()>>,
+    finished: tokio_util::sync::CancellationToken,
     /// Configured event sinks for persistence log events. Swapped on config
     /// reload so events follow the latest observability configuration.
     events: Mutex<Arc<CompositeEventSink>>,
@@ -632,6 +677,7 @@ impl PersistManager {
             wake: Arc::new(Notify::new()),
             stop: Arc::new(AtomicBool::new(false)),
             task: OnceLock::new(),
+            finished: tokio_util::sync::CancellationToken::new(),
             events: Mutex::new(Arc::new(CompositeEventSink::new(Vec::new()))),
         })
     }
@@ -715,6 +761,7 @@ impl PersistManager {
     /// Remove a zone's persistence state, e.g. when a zone is dropped.
     pub fn remove_zone(&self, label: &str) {
         self.zones.lock().remove(label);
+        self.wake.notify_one();
     }
 
     /// Idempotently spawn the writer task on `handle`. The module start hook
@@ -722,7 +769,10 @@ impl PersistManager {
     pub fn start_on(self: &Arc<Self>, handle: &tokio::runtime::Handle) {
         let _ = self.task.get_or_init(|| {
             let manager = Arc::clone(self);
-            handle.spawn(async move { manager.run().await })
+            // Signals cancel the old token and install a fresh one. Subscribe
+            // before spawning, rather than repeatedly loading the fresh token.
+            let shutdown = ferron_core::shutdown::SHUTDOWN_TOKEN.load_full();
+            handle.spawn(async move { manager.run(shutdown).await })
         });
     }
 
@@ -738,6 +788,13 @@ impl PersistManager {
     pub fn stop(&self) {
         self.stop.store(true, Ordering::Relaxed);
         self.wake.notify_one();
+    }
+
+    pub async fn shutdown(&self) {
+        self.stop();
+        if self.task.get().is_some() {
+            self.finished.cancelled().await;
+        }
     }
 
     /// Flush every zone and sync its journal. Blocks until done.
@@ -764,6 +821,9 @@ impl PersistManager {
     fn maybe_compact_all(&self) {
         let zones: Vec<Arc<ZonePersistState>> = self.zones.lock().values().cloned().collect();
         for zone in zones {
+            if zone.entry_source.lock().is_none() {
+                continue;
+            }
             match zone.maybe_compact() {
                 Ok(true) => {
                     self.emit_log(
@@ -783,7 +843,9 @@ impl PersistManager {
                 Err(error) => {
                     // Compaction is a durability optimization, not the source
                     // of truth: the journal keeps working, so warn and retry
-                    // on the next cycle instead of disabling the zone.
+                    // after its interval instead of spinning on an overdue
+                    // deadline or disabling the zone.
+                    *zone.last_compact.lock() = Instant::now();
                     zone.emit_metric(
                         "ferron.cache.persistence_errors",
                         MetricType::Counter,
@@ -808,21 +870,47 @@ impl PersistManager {
         }
     }
 
-    /// Writer task body: flush due zones and compact due zones, then wait
-    /// for a queued record, the poll interval, or shutdown.
-    async fn run(self: Arc<Self>) {
+    /// One serialized disk operation runs off the async executor at a time.
+    /// Empty writers wait for mutations; timed work waits for its actual deadline.
+    async fn run(self: Arc<Self>, shutdown: Arc<tokio_util::sync::CancellationToken>) {
         loop {
-            if self.stop.load(Ordering::Relaxed)
-                || ferron_core::shutdown::SHUTDOWN_TOKEN.load().is_cancelled()
-            {
-                self.flush_all();
+            if self.stop.load(Ordering::Relaxed) || shutdown.is_cancelled() {
+                let manager = self.clone();
+                if let Err(error) = tokio::task::spawn_blocking(move || manager.flush_all()).await {
+                    ferron_core::log_error!("Cache final flush worker failed: {error}");
+                }
+                self.finished.cancel();
                 return;
             }
-            self.drain_due();
-            self.maybe_compact_all();
+            let due = self
+                .zones
+                .lock()
+                .values()
+                .filter_map(|zone| zone.next_deadline())
+                .min();
+            if due.is_some_and(|deadline| deadline <= Instant::now()) {
+                let manager = self.clone();
+                if let Err(error) = tokio::task::spawn_blocking(move || {
+                    manager.drain_due();
+                    manager.maybe_compact_all();
+                })
+                .await
+                {
+                    ferron_core::log_error!("Cache persistence worker failed: {error}");
+                    self.finished.cancel();
+                    return;
+                }
+                continue;
+            }
             tokio::select! {
                 _ = self.wake.notified() => {}
-                _ = tokio::time::sleep(WRITER_POLL_INTERVAL) => {}
+                _ = shutdown.cancelled() => {}
+                _ = async {
+                    match due {
+                        Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {}
             }
         }
     }

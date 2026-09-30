@@ -31,6 +31,14 @@ pub use validator::HttpCacheConfigurationValidator;
 use crate::store::persist::writer::PersistManager;
 
 pub static SECONDARY_RUNTIME: OnceLock<tokio::runtime::Handle> = OnceLock::new();
+static PERSISTENT_WRITER: OnceLock<Arc<PersistManager>> = OnceLock::new();
+
+/// Finish the serialized journal writer before its runtime is destroyed.
+pub async fn shutdown_persistence() {
+    if let Some(writer) = PERSISTENT_WRITER.get() {
+        writer.shutdown().await;
+    }
+}
 
 /// Module loader for the HTTP cache module.
 pub struct HttpCacheModuleLoader {
@@ -356,6 +364,7 @@ impl ferron_core::Module for HttpCacheModule {
         runtime: &mut ferron_core::runtime::Runtime,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let persist = self.persist.clone();
+        let _ = PERSISTENT_WRITER.set(persist.clone());
         let _ = SECONDARY_RUNTIME.set(runtime.block_on(async move {
             // `start` grabs the current tokio handle, which is the secondary
             // runtime while running inside `block_on`.

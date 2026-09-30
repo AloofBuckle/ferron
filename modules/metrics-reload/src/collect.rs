@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::time::Duration;
 
 use ferron_core::shutdown::RELOAD_STATE;
 use ferron_observability::{
@@ -12,8 +11,6 @@ pub async fn collect_reload_metrics(
     event_sink: Arc<CompositeEventSink>,
     cancel_token: tokio_util::sync::CancellationToken,
 ) {
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
     let mut reload_state = RELOAD_STATE.load_full();
 
     loop {

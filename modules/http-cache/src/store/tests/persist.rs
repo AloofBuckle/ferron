@@ -692,9 +692,41 @@ fn writer_task_flushes_periodically() {
         }
     }
     assert!(found, "writer task did not flush the journal");
-    manager.stop();
-    // Give the task a chance to observe the stop and exit cleanly.
-    std::thread::sleep(Duration::from_millis(50));
+    rt.block_on(async {
+        tokio::time::timeout(Duration::from_secs(2), manager.shutdown())
+            .await
+            .unwrap();
+    });
+}
+
+#[test]
+fn shutdown_flushes_records_before_their_flush_deadline() {
+    let dir = TempDir::new();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let manager = PersistManager::new();
+    let zone = manager.register_zone(
+        "shutdown".into(),
+        dir.path().clone(),
+        false,
+        Duration::from_secs(3600),
+    );
+    zone.record_put("initial", &public_entry());
+    zone.flush_all_sync().unwrap();
+    assert!(!zone.flush_due());
+    zone.record_put("pending", &public_entry());
+    manager.start_on(rt.handle());
+    rt.block_on(async {
+        tokio::time::timeout(Duration::from_secs(2), manager.shutdown())
+            .await
+            .unwrap();
+    });
+    let records = decode_file(&zone.journal_path());
+    assert_eq!(records.len(), 2);
+    assert!(matches!(&records[1], DecodedRecord::Put { key, .. } if key == "pending"));
 }
 
 #[test]

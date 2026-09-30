@@ -13,7 +13,7 @@ use http::header::{self, HeaderMap};
 use quick_cache::sync::Cache;
 use quick_cache::{DefaultHashBuilder, Lifecycle, UnitWeighter};
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
-use tokio::sync::Notify;
+use tokio_util::sync::CancellationToken;
 
 use crate::lscache::PurgeOperation;
 use crate::policy::{recalculate_freshness, CacheScope};
@@ -97,7 +97,7 @@ pub struct CacheStore {
 
 /// Tracks an in-flight upstream fetch for a specific cache key.
 struct InflightEntry {
-    notify: Arc<Notify>,
+    notify: Arc<CancellationToken>,
 }
 
 /// Cache lifecycle hook. Holds the optional persistence state so evictions
@@ -282,7 +282,7 @@ impl CacheStore {
 
     /// Try to become the in-flight fetch leader for `cache_key`.
     #[inline]
-    pub fn begin_fetch(&self, cache_key: &str) -> (bool, Arc<Notify>) {
+    pub fn begin_fetch(&self, cache_key: &str) -> (bool, Arc<CancellationToken>) {
         let mut is_leader = false;
         let entry = self
             .inflight
@@ -290,7 +290,7 @@ impl CacheStore {
             .or_insert_with(|| {
                 is_leader = true;
                 InflightEntry {
-                    notify: Arc::new(Notify::new()),
+                    notify: Arc::new(CancellationToken::new()),
                 }
             });
         let notify = entry.notify.clone();
@@ -304,7 +304,9 @@ impl CacheStore {
     #[inline]
     pub fn complete_fetch(&self, cache_key: &str) {
         if let Some((_, entry)) = self.inflight.remove(cache_key) {
-            entry.notify.notify_waiters();
+            // Completion remains observable even when the follower has not
+            // constructed/polled its wait future yet.
+            entry.notify.cancel();
             self.active_locks.fetch_sub(1, Ordering::Relaxed);
         }
     }

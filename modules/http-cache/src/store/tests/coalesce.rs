@@ -1,4 +1,25 @@
 use super::*;
+
+#[tokio::test]
+async fn completion_before_wait_is_retained_for_all_followers() {
+    let store = CacheStore::new(16);
+    let (leader, _) = store.begin_fetch("late-waiter");
+    assert!(leader);
+    let (_, first) = store.begin_fetch("late-waiter");
+    let (_, second) = store.begin_fetch("late-waiter");
+    store.complete_fetch("late-waiter");
+    tokio::time::timeout(Duration::from_secs(1), async {
+        first.cancelled().await;
+        second.cancelled().await;
+    })
+    .await
+    .unwrap();
+    assert_eq!(store.active_locks(), 0);
+    let (new_leader, fresh) = store.begin_fetch("late-waiter");
+    assert!(new_leader);
+    assert!(!fresh.is_cancelled());
+    store.complete_fetch("late-waiter");
+}
 use rustc_hash::FxHashMap;
 #[test]
 fn begin_fetch_returns_leader_and_follower() {
@@ -34,7 +55,7 @@ fn complete_fetch_notifies_waiters() {
     let handle = std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async move {
-            follower_notify.notified().await;
+            follower_notify.cancelled().await;
             fired_clone.store(true, Ordering::SeqCst);
         });
     });
@@ -112,7 +133,7 @@ async fn vary_variants_have_distinct_inflight_keys() {
     let handle = std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async move {
-            br_notify.notified().await;
+            br_notify.cancelled().await;
             fired_clone.store(true, Ordering::SeqCst);
         });
     });
@@ -139,7 +160,7 @@ async fn follower_wait_times_out_when_leader_never_completes() {
     let (is_follower, follower_notify) = store.begin_fetch(key);
     assert!(!is_follower);
 
-    let timed_out = tokio::time::timeout(Duration::from_millis(50), follower_notify.notified())
+    let timed_out = tokio::time::timeout(Duration::from_millis(50), follower_notify.cancelled())
         .await
         .is_err();
     assert!(
@@ -202,7 +223,7 @@ async fn concurrent_misses_coalesce_to_single_upstream_fetch() {
             #[allow(clippy::needless_return)]
             if !is_leader {
                 // Follower: wait for leader to complete
-                notify.notified().await;
+                notify.cancelled().await;
                 // Re-check cache
                 let LookupOutcome { entry: lookup, .. } =
                     store.lookup(&base_key, &headers, &cookies, None, &FxHashMap::default());
@@ -292,7 +313,7 @@ async fn follower_gets_cached_response_after_leader_stores() {
     let cookies_clone = cookies.clone();
     let follower_handle = tokio::spawn(async move {
         // Follower waits
-        notify.notified().await;
+        notify.cancelled().await;
         // After notification, re-check cache
         let LookupOutcome { entry: lookup, .. } = store_clone.lookup(
             &base_key_clone,
@@ -365,7 +386,7 @@ async fn leader_non_cacheable_wakes_followers_without_cached_entry() {
     let headers_clone = headers.clone();
     let cookies_clone = cookies.clone();
     let follower_handle = tokio::spawn(async move {
-        notify.notified().await;
+        notify.cancelled().await;
         let LookupOutcome { entry: lookup, .. } = store_clone.lookup(
             &base_key_clone,
             &headers_clone,
